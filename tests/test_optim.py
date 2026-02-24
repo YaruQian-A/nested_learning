@@ -48,3 +48,15 @@ def test_deep_momentum_nl_preconditioner_skips_mismatched_shapes() -> None:
     out = optimizer(grad_bias, context=context)
     assert torch.allclose(out, grad_bias)
     assert optimizer.last_metrics["proj_skipped"] == 1.0
+
+
+def test_deep_momentum_nl_preconditioner_outputs_orthogonal_update() -> None:
+    torch.manual_seed(0)
+    grad = torch.randn(3, 5)
+    context = torch.randn(5)
+    optimizer = DeepMomentum(beta=0.0, beta2=0.0, variant="nl_l2_precond")
+    update = optimizer(grad, context=context)
+    unit = context / context.norm()
+    # Each row update should be orthogonal to the context direction.
+    proj = (update * unit).sum(dim=-1).abs()
+    assert torch.all(proj < 1e-5)

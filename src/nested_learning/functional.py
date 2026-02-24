@@ -48,8 +48,16 @@ def call_with_deltas(
     return call_with_params(module, params_with_deltas(module, deltas), *args, **kwargs)
 
 
-def require_grad_params(params: Mapping[str, torch.Tensor]) -> ParamDict:
-    return {name: value.detach().requires_grad_(True) for name, value in params.items()}
+def require_grad_params(
+    params: Mapping[str, torch.Tensor], *, detach: bool = True
+) -> ParamDict:
+    out: ParamDict = {}
+    for name, value in params.items():
+        if detach:
+            out[name] = value.detach().requires_grad_(True)
+        else:
+            out[name] = value.requires_grad_(True)
+    return out
 
 
 def grads_to_dict(params: ParamDict, grads: Tuple[torch.Tensor | None, ...]) -> ParamDict:

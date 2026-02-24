@@ -1,8 +1,30 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+usage() {
+  cat <<'EOF'
+Usage: scripts/data/run_sample.sh [TOKENIZER_MODEL_PATH]
+
+Builds a small filtered corpus sample, trains a tokenizer if missing, and shards it.
+
+Args:
+  TOKENIZER_MODEL_PATH  Optional tokenizer model path.
+                        Default: artifacts/tokenizer/refinedweb_mix/spm_32000_unigram.model
+EOF
+}
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  usage
+  exit 0
+fi
+
+if [[ $# -gt 1 ]]; then
+  usage
+  exit 2
+fi
+
 TOKENIZER_MODEL=${1:-artifacts/tokenizer/refinedweb_mix/spm_32000_unigram.model}
-TOKENIZER_DIR="$(dirname "${TOKENIZER_MODEL}")"
+TOKENIZER_DIR="$(dirname -- "${TOKENIZER_MODEL}")"
 
 if [[ ! -f "data/filtered/refinedweb_en_sample.txt" ]]; then
   echo "[Data] Creating filtered RefinedWeb sample"

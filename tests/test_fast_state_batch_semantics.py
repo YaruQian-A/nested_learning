@@ -24,3 +24,17 @@ def test_fast_state_batch_semantics_allows_batch1() -> None:
     )
     _validate_fast_state_batch_semantics(cfg)
 
+
+def test_fast_state_batch_semantics_warns_with_structured_payload_when_not_strict(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cfg = OmegaConf.create(
+        {
+            "train": {"use_fast_state": True, "strict_streaming_contract": False},
+            "data": {"batch_size": 3},
+        }
+    )
+    _validate_fast_state_batch_semantics(cfg)
+    captured = capsys.readouterr()
+    assert "warning_code" in captured.out
+    assert "shared_fast_state_batch" in captured.out

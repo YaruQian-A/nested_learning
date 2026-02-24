@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, cast
 
 import torch
@@ -10,6 +10,21 @@ from .optim.manager import LevelConfig, LevelOptimizerManager
 from .titan.self_modifying import SelfModifyingTitansState
 
 ParamDict = Dict[str, torch.Tensor]
+
+
+@dataclass
+class CMSChunkBuffer:
+    """
+    Streaming CMS chunk buffer persisted across multiple model calls.
+
+    This is required to preserve update-period cadence when a logical sequence is
+    processed in several chunked forward/update calls.
+    """
+
+    inputs: list[torch.Tensor] = field(default_factory=list)
+    teach: list[torch.Tensor] = field(default_factory=list)
+    active: list[torch.Tensor] = field(default_factory=list)
+    count: int = 0
 
 
 def init_module_deltas(module: nn.Module) -> ParamDict:
@@ -28,6 +43,7 @@ def init_module_deltas(module: nn.Module) -> ParamDict:
 class BlockFastState:
     titan_params: ParamDict | None
     cms_params: Dict[str, ParamDict]
+    cms_online_buffers: Dict[str, CMSChunkBuffer]
     level_manager: LevelOptimizerManager
     selfmod_state: SelfModifyingTitansState | None = None
 
@@ -45,6 +61,7 @@ def build_block_fast_state(
     if titan_module is not None:
         titan_params = init_module_deltas(titan_module)
     cms_params = {name: init_module_deltas(block) for name, block in cms_blocks.items()}
+    cms_online_buffers = {name: CMSChunkBuffer() for name in cms_blocks}
     level_cfg = LevelConfig(specs=specs, optimizer_configs=optimizer_configs, default_lr=default_lr)
     level_manager = LevelOptimizerManager(level_cfg)
     selfmod_state = None
@@ -55,6 +72,7 @@ def build_block_fast_state(
     return BlockFastState(
         titan_params=titan_params,
         cms_params=cms_params,
+        cms_online_buffers=cms_online_buffers,
         level_manager=level_manager,
         selfmod_state=selfmod_state,
     )
@@ -63,3 +81,28 @@ def build_block_fast_state(
 @dataclass
 class ModelFastState:
     blocks: list[BlockFastState]
+
+
+@dataclass
+class AttentionKVCache:
+    """
+    Per-layer autoregressive attention cache.
+
+    Shapes:
+    - key:   [batch, heads, cached_tokens, head_dim]
+    - value: [batch, heads, cached_tokens, head_dim]
+    """
+
+    key: torch.Tensor
+    value: torch.Tensor
+
+
+@dataclass
+class ModelAttentionCache:
+    """
+    Model-level container for per-block attention caches.
+
+    Blocks without attention store `None` entries.
+    """
+
+    blocks: list[AttentionKVCache | None]

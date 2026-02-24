@@ -114,6 +114,7 @@ class LevelOptimizerManager:
         *,
         context: torch.Tensor | None = None,
         force: bool = False,
+        differentiable: bool = False,
     ) -> tuple[Dict[str, torch.Tensor], float]:
         if (not force) and (not self.should_update(level)):
             return params, 0.0
@@ -121,6 +122,17 @@ class LevelOptimizerManager:
         lr = self.learning_rates[level]
         updated: Dict[str, torch.Tensor] = {}
         total_norm = 0.0
+        if differentiable:
+            for name, param in params.items():
+                grad = grads.get(name)
+                if grad is None:
+                    updated[name] = param
+                    continue
+                updated[name] = param - lr * grad
+                total_norm += float(grad.detach().norm().item())
+            self.clock.record_update(level)
+            self._last_metrics[level] = {"differentiable_updates": 1.0}
+            return updated, total_norm
         with torch.no_grad():
             for name, param in params.items():
                 grad = grads.get(name)

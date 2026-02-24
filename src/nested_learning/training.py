@@ -9,7 +9,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import Dict, Protocol, Tuple, cast
+from typing import Dict, Iterator, Protocol, Tuple, cast
 
 import numpy as np
 import torch
@@ -227,13 +227,17 @@ def compute_teach_signal(
     logits: torch.Tensor,
     tokens: torch.Tensor,
     *,
+    next_tokens: torch.Tensor | None = None,
     ignore_index: int | None = None,
 ) -> torch.Tensor:
     """
     Approximate dL/dh where h is the hidden state before the LM head.
 
-    This matches the gradient of mean next-token CE:
-      CE(logits[:, :-1], tokens[:, 1:]) with mean reduction.
+    This matches the gradient of mean next-token CE.
+
+    By default this corresponds to CE(logits[:, :-1], tokens[:, 1:]).
+    If `next_tokens` is provided, the final logit position is also supervised
+    against that boundary target (used for chunked streaming boundaries).
 
     If ignore_index is provided, targets equal to ignore_index are masked out and
     the mean reduction denominator becomes the number of active targets (matching
@@ -241,52 +245,70 @@ def compute_teach_signal(
     """
     logits_detached = logits.detach()
     probs = torch.softmax(logits_detached, dim=-1)
-    target_tokens = tokens[:, 1:]
-    residual = probs[:, :-1].clone()
+    residual = probs.clone()
+    batch_size, seq_len, _ = residual.shape
 
-    if ignore_index is None:
-        safe_targets = target_tokens
-        src = -torch.ones(
-            (*safe_targets.shape, 1),
-            device=residual.device,
-            dtype=residual.dtype,
-        )
-        denom: torch.Tensor | float = max(1, tokens.size(0) * max(1, tokens.size(1) - 1))
-    else:
-        active = target_tokens != ignore_index
-        safe_targets = torch.where(active, target_tokens, torch.zeros_like(target_tokens))
-        active_f = active.to(dtype=residual.dtype)
-        residual.mul_(active_f.unsqueeze(-1))
-        src = -active_f.unsqueeze(-1)
-        denom = active_f.sum().clamp(min=1.0)
+    targets = torch.zeros(
+        batch_size,
+        seq_len,
+        device=tokens.device,
+        dtype=tokens.dtype,
+    )
+    active = torch.zeros(
+        batch_size,
+        seq_len,
+        device=tokens.device,
+        dtype=torch.bool,
+    )
+    if seq_len > 1:
+        targets[:, :-1] = tokens[:, 1:]
+        active[:, :-1] = True
+    if next_tokens is not None:
+        if next_tokens.ndim == 2 and next_tokens.size(1) == 1:
+            next_targets = next_tokens[:, 0]
+        elif next_tokens.ndim == 1:
+            next_targets = next_tokens
+        else:
+            raise ValueError("next_tokens must have shape [B] or [B, 1]")
+        if next_targets.size(0) != batch_size:
+            raise ValueError("next_tokens batch dimension must match tokens batch dimension")
+        targets[:, -1] = next_targets.to(device=tokens.device, dtype=tokens.dtype)
+        active[:, -1] = True
+    if ignore_index is not None:
+        active = active & (targets != ignore_index)
 
+    active_f = active.to(dtype=residual.dtype)
+    residual.mul_(active_f.unsqueeze(-1))
+    safe_targets = torch.where(active, targets, torch.zeros_like(targets))
+    src = -active_f.unsqueeze(-1)
     residual.scatter_add_(-1, safe_targets.unsqueeze(-1), src)
+    denom: torch.Tensor = active_f.sum().clamp(min=1.0)
     residual = residual / denom
 
     head_weight = model.lm_head.weight.detach()
     if head_weight.dtype != residual.dtype:
         head_weight = head_weight.to(dtype=residual.dtype)
     grad = residual @ head_weight
-    pad = torch.zeros(
-        grad.size(0),
-        1,
-        grad.size(-1),
-        device=grad.device,
-        dtype=grad.dtype,
-    )
-    return torch.cat([grad, pad], dim=1)
+    return grad
 
 
 def _compute_layer_teach_signals(
-    loss: torch.Tensor, block_outputs: list[torch.Tensor]
+    loss: torch.Tensor,
+    block_outputs: list[torch.Tensor],
+    *,
+    detach: bool = True,
+    create_graph: bool = False,
 ) -> list[torch.Tensor]:
     grads = torch.autograd.grad(
         loss,
         block_outputs,
         retain_graph=True,
+        create_graph=create_graph,
         allow_unused=False,
     )
-    return [g.detach() for g in grads]
+    if detach:
+        return [g.detach() for g in grads]
+    return list(grads)
 
 
 def _compute_surprise_override(
@@ -295,12 +317,16 @@ def _compute_surprise_override(
     logits: torch.Tensor,
     tokens: torch.Tensor,
     loss: torch.Tensor,
+    next_tokens: torch.Tensor | None = None,
 ) -> float | None:
     normalized = str(metric).strip().lower()
     if normalized == "loss":
         return float(loss.detach().item())
     if normalized == "logit_entropy":
-        logits_detached = logits[:, :-1].detach().float()
+        supervised_steps = int(tokens.size(1) - 1 + (0 if next_tokens is None else 1))
+        if supervised_steps <= 0:
+            return None
+        logits_detached = logits[:, :supervised_steps].detach().float()
         probs = torch.softmax(logits_detached, dim=-1)
         entropy = -(probs * torch.log(probs.clamp(min=1e-9))).sum(dim=-1).mean()
         return float(entropy.item())
@@ -321,6 +347,45 @@ def _infer_online_chunk_size(model: HOPEModel) -> int | None:
                 continue
             min_period = period if min_period is None else min(min_period, period)
     return min_period
+
+
+def _iter_online_token_chunks(
+    tokens: torch.Tensor, *, chunk_size: int
+) -> Iterator[tuple[torch.Tensor, bool]]:
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be >= 1")
+    seq_len = tokens.size(1)
+    for core_start in range(0, seq_len, chunk_size):
+        core_end = min(core_start + chunk_size, seq_len)
+        if core_end <= core_start:
+            continue
+        # Carry one-token overlap so chunk boundaries still include next-token supervision.
+        chunk_start = core_start - 1 if core_start > 0 else core_start
+        chunk_tokens = tokens[:, chunk_start:core_end]
+        finalize_updates = core_end >= seq_len
+        yield chunk_tokens, finalize_updates
+
+
+def _iter_online_boundary_chunks(
+    tokens: torch.Tensor, *, chunk_size: int
+) -> Iterator[tuple[torch.Tensor, torch.Tensor | None, bool]]:
+    """
+    Yield non-overlapping chunks plus the boundary target token for chunk end.
+
+    This enables exact boundary supervision without one-token overlap.
+    """
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be >= 1")
+    seq_len = tokens.size(1)
+    for start in range(0, seq_len, chunk_size):
+        end = min(start + chunk_size, seq_len)
+        if end <= start:
+            continue
+        next_tokens = None
+        if end < seq_len:
+            next_tokens = tokens[:, end]
+        finalize_updates = end >= seq_len
+        yield tokens[:, start:end], next_tokens, finalize_updates
 
 
 class _HasLMHead(Protocol):
@@ -386,21 +451,96 @@ def maybe_save_checkpoint(
 def _validate_distributed_config(cfg: DictConfig, distributed: bool) -> None:
     if not distributed:
         return
+    strict = bool(cfg.train.get("strict_streaming_contract", False))
     fail_if_faithful_disabled = bool(cfg.train.get("fail_if_paper_faithful_disabled", False))
-    if not fail_if_faithful_disabled:
+    fail_hard = strict or fail_if_faithful_disabled
+    if not fail_hard:
         return
     if bool(cfg.train.get("per_layer_teach_signal", False)):
         raise RuntimeError(
             "train.per_layer_teach_signal=true is not supported under DDP in this repo. "
-            "Set train.fail_if_paper_faithful_disabled=false to allow the fallback, "
+            "Set train.strict_streaming_contract=false and "
+            "train.fail_if_paper_faithful_disabled=false to allow the fallback, "
             "or run single-process training."
         )
     if bool(cfg.train.get("online_updates", False)):
         raise RuntimeError(
             "train.online_updates=true is not supported under DDP in this repo. "
-            "Set train.fail_if_paper_faithful_disabled=false to allow the fallback, "
+            "Set train.strict_streaming_contract=false and "
+            "train.fail_if_paper_faithful_disabled=false to allow the fallback, "
             "or run single-process training."
         )
+    if bool(cfg.train.get("online_boundary_targets", False)):
+        raise RuntimeError(
+            "train.online_boundary_targets=true is not supported under DDP in this repo. "
+            "Set train.strict_streaming_contract=false and "
+            "train.fail_if_paper_faithful_disabled=false to allow the fallback, "
+            "or run single-process training."
+        )
+    if bool(cfg.train.get("online_carry_attention_cache", False)):
+        raise RuntimeError(
+            "train.online_carry_attention_cache=true is not supported under DDP in this repo. "
+            "Set train.strict_streaming_contract=false and "
+            "train.fail_if_paper_faithful_disabled=false to allow the fallback, "
+            "or run single-process training."
+        )
+
+
+def _emit_streaming_warning(
+    *,
+    code: str,
+    message: str,
+    details: dict[str, object] | None = None,
+) -> None:
+    payload: dict[str, object] = {"warning_code": code, "message": message}
+    if details:
+        payload["details"] = details
+    print(f"[train.warn] {json.dumps(payload, sort_keys=True)}")
+
+
+def _validate_paper_auditing_variant(cfg: DictConfig) -> None:
+    strict = bool(cfg.train.get("strict_streaming_contract", False))
+    block_variant = str(cfg.model.get("block_variant", "")).strip().lower()
+    if not block_variant:
+        return
+    allowed = {"hope_attention", "hope_selfmod"}
+    if block_variant in allowed:
+        return
+    msg = (
+        "strict streaming contract expects a paper-defined HOPE variant "
+        f"({sorted(allowed)}), got model.block_variant={block_variant!r}"
+    )
+    if strict:
+        raise RuntimeError(msg)
+    _emit_streaming_warning(
+        code="non_paper_variant",
+        message=msg,
+        details={"block_variant": block_variant},
+    )
+
+
+def _validate_tied_lm_head_for_paper_auditing(
+    cfg: DictConfig,
+    model: torch.nn.Module,
+) -> None:
+    strict = bool(cfg.train.get("strict_streaming_contract", False))
+    fail_if_faithful_disabled = bool(cfg.train.get("fail_if_paper_faithful_disabled", False))
+    if not (strict or fail_if_faithful_disabled):
+        return
+    lm_head = getattr(model, "lm_head", None)
+    embed = getattr(model, "embed", None)
+    if lm_head is None or embed is None:
+        return
+    lm_weight = getattr(lm_head, "weight", None)
+    emb_weight = getattr(embed, "weight", None)
+    if lm_weight is None or emb_weight is None:
+        return
+    if lm_weight.data_ptr() == emb_weight.data_ptr():
+        return
+    raise RuntimeError(
+        "paper-auditing mode requires tied LM head and embedding weights "
+        "(lm_head.weight must alias embed.weight)."
+    )
 
 
 def _validate_fast_state_batch_semantics(cfg: DictConfig) -> None:
@@ -420,9 +560,126 @@ def _validate_fast_state_batch_semantics(cfg: DictConfig) -> None:
         "train.use_fast_state=true currently shares CMS/TITAN fast state across the batch. "
         "For strict per-context semantics, set data.batch_size=1."
     )
-    if bool(cfg.train.get("fail_if_paper_faithful_disabled", False)):
+    strict = bool(cfg.train.get("strict_streaming_contract", False))
+    fail_if_faithful_disabled = bool(cfg.train.get("fail_if_paper_faithful_disabled", False))
+    if strict or fail_if_faithful_disabled:
         raise RuntimeError(msg)
-    print(f"[train] {msg}")
+    _emit_streaming_warning(
+        code="shared_fast_state_batch",
+        message=msg,
+        details={"batch_size": batch_size},
+    )
+
+
+def _validate_online_update_fast_state_semantics(cfg: DictConfig) -> None:
+    train_cfg = cfg.get("train")
+    if train_cfg is None:
+        return
+    online_updates = bool(train_cfg.get("online_updates", False))
+    use_fast_state = bool(train_cfg.get("use_fast_state", False))
+    if not online_updates or use_fast_state:
+        return
+    msg = (
+        "train.online_updates=true with train.use_fast_state=false applies online writes "
+        "directly to base parameters within each step. This can make gradients across chunks "
+        "harder to interpret. Use train.use_fast_state=true for paper-faithful runs."
+    )
+    strict = bool(train_cfg.get("strict_streaming_contract", False))
+    fail_if_faithful_disabled = bool(train_cfg.get("fail_if_paper_faithful_disabled", False))
+    if strict or fail_if_faithful_disabled:
+        raise RuntimeError(msg)
+    _emit_streaming_warning(
+        code="online_updates_without_fast_state",
+        message=msg,
+        details={"online_updates": True, "use_fast_state": False},
+    )
+
+
+def _resolve_algorithm_mode(cfg: DictConfig) -> str:
+    mode = str(cfg.train.get("algorithm_mode", "two_pass_stopgrad_updates")).strip()
+    allowed = {"two_pass_stopgrad_updates", "boundary_state_grad_through_write"}
+    if mode not in allowed:
+        raise RuntimeError(f"Unsupported train.algorithm_mode={mode!r}; allowed={sorted(allowed)}")
+    return mode
+
+
+def _validate_algorithm_mode_constraints(
+    cfg: DictConfig,
+    *,
+    algorithm_mode: str,
+    distributed: bool,
+) -> None:
+    if algorithm_mode != "boundary_state_grad_through_write":
+        return
+    if distributed:
+        raise RuntimeError(
+            "train.algorithm_mode='boundary_state_grad_through_write' is not supported in DDP."
+        )
+    if not bool(cfg.train.get("online_updates", False)):
+        raise RuntimeError(
+            "train.algorithm_mode='boundary_state_grad_through_write' requires "
+            "train.online_updates=true."
+        )
+    if not bool(cfg.train.get("per_layer_teach_signal", False)):
+        raise RuntimeError(
+            "train.algorithm_mode='boundary_state_grad_through_write' requires "
+            "train.per_layer_teach_signal=true."
+        )
+    if not bool(cfg.train.get("use_fast_state", False)):
+        raise RuntimeError(
+            "train.algorithm_mode='boundary_state_grad_through_write' requires "
+            "train.use_fast_state=true."
+        )
+    if bool(cfg.train.get("online_carry_attention_cache", False)) and not bool(
+        cfg.train.get("online_boundary_targets", False)
+    ):
+        raise RuntimeError(
+            "online_carry_attention_cache=true requires train.online_boundary_targets=true "
+            "(non-overlap chunking)."
+        )
+    _emit_streaming_warning(
+        code="experimental_boundary_state_mode",
+        message=(
+            "train.algorithm_mode='boundary_state_grad_through_write' is an experimental "
+            "single-process path for mechanism probing and may use more memory."
+        ),
+        details={"algorithm_mode": algorithm_mode},
+    )
+
+
+def _validate_online_chunking_constraints(cfg: DictConfig) -> None:
+    online_updates = bool(cfg.train.get("online_updates", False))
+    online_boundary_targets = bool(cfg.train.get("online_boundary_targets", False))
+    online_carry_attention_cache = bool(cfg.train.get("online_carry_attention_cache", False))
+    if online_carry_attention_cache and not online_updates:
+        raise RuntimeError("online_carry_attention_cache=true requires train.online_updates=true")
+    if online_carry_attention_cache and not online_boundary_targets:
+        raise RuntimeError(
+            "online_carry_attention_cache=true requires train.online_boundary_targets=true "
+            "(non-overlap chunking)."
+        )
+
+
+def _check_online_supervised_pairs(
+    *,
+    strict: bool,
+    observed_pairs: int,
+    seq_len: int,
+) -> None:
+    expected_pairs = max(int(seq_len) - 1, 0)
+    if observed_pairs == expected_pairs:
+        return
+    msg = (
+        "online chunk supervision mismatch: observed pair coverage does not match sequence length "
+        f"(observed_pairs={observed_pairs}, expected_pairs={expected_pairs})"
+    )
+    if strict:
+        raise RuntimeError(msg)
+    _emit_streaming_warning(
+        code="online_supervision_mismatch",
+        message=msg,
+        details={"observed_pairs": observed_pairs, "expected_pairs": expected_pairs},
+    )
 
 
 def run_training_loop(
@@ -432,8 +689,17 @@ def run_training_loop(
     distributed: bool = False,
     dist_ctx: DistributedContext | None = None,
 ) -> Dict[str, float]:
+    algorithm_mode = _resolve_algorithm_mode(cfg)
+    _validate_algorithm_mode_constraints(
+        cfg,
+        algorithm_mode=algorithm_mode,
+        distributed=distributed,
+    )
+    _validate_online_chunking_constraints(cfg)
     _validate_distributed_config(cfg, distributed)
+    _validate_paper_auditing_variant(cfg)
     _validate_fast_state_batch_semantics(cfg)
+    _validate_online_update_fast_state_semantics(cfg)
     model = build_model_from_cfg(cfg.model).to(device)
     train_seed = cfg.train.get("seed")
     deterministic = cfg.train.get("deterministic", False)
@@ -459,6 +725,8 @@ def run_training_loop(
     else:
         base_model = model
 
+    _validate_tied_lm_head_for_paper_auditing(cfg, base_model)
+
     seed_offset = 0
     if train_seed is not None and dist_ctx is not None:
         seed_offset = dist_ctx.rank
@@ -480,26 +748,55 @@ def run_training_loop(
     per_layer_teach = bool(cfg.train.get("per_layer_teach_signal", False))
     online_updates = bool(cfg.train.get("online_updates", False))
     online_chunk_size = int(cfg.train.get("online_chunk_size", 0) or 0)
+    online_boundary_targets = bool(cfg.train.get("online_boundary_targets", False))
+    online_carry_attention_cache = bool(cfg.train.get("online_carry_attention_cache", False))
     use_fast_state = bool(cfg.train.get("use_fast_state", False))
     fail_if_faithful_disabled = bool(cfg.train.get("fail_if_paper_faithful_disabled", False))
+    strict_streaming = bool(cfg.train.get("strict_streaming_contract", False))
     if distributed and per_layer_teach:
-        msg = "[train] per_layer_teach_signal disabled under DDP (uses base model methods)"
-        if fail_if_faithful_disabled:
+        msg = "per_layer_teach_signal disabled under DDP (uses base model methods)"
+        if fail_if_faithful_disabled or strict_streaming:
             raise RuntimeError(
-                f"{msg}. Set train.fail_if_paper_faithful_disabled=false to allow the fallback, "
+                f"{msg}. Set train.strict_streaming_contract=false and "
+                "train.fail_if_paper_faithful_disabled=false to allow the fallback, "
                 "or run single-process training."
             )
-        print(msg)
+        _emit_streaming_warning(
+            code="ddp_disables_per_layer_teach",
+            message=msg,
+            details={"distributed": True},
+        )
         per_layer_teach = False
     if distributed and online_updates:
-        msg = "[train] online_updates disabled under DDP (uses base model methods)"
-        if fail_if_faithful_disabled:
+        msg = "online_updates disabled under DDP (uses base model methods)"
+        if fail_if_faithful_disabled or strict_streaming:
             raise RuntimeError(
-                f"{msg}. Set train.fail_if_paper_faithful_disabled=false to allow the fallback, "
+                f"{msg}. Set train.strict_streaming_contract=false and "
+                "train.fail_if_paper_faithful_disabled=false to allow the fallback, "
                 "or run single-process training."
             )
-        print(msg)
+        _emit_streaming_warning(
+            code="ddp_disables_online_updates",
+            message=msg,
+            details={"distributed": True},
+        )
         online_updates = False
+    if online_boundary_targets and not online_updates:
+        msg = "online_boundary_targets=true requires train.online_updates=true"
+        if fail_if_faithful_disabled or strict_streaming:
+            raise RuntimeError(msg)
+        _emit_streaming_warning(
+            code="boundary_targets_without_online_updates",
+            message=msg,
+        )
+        online_boundary_targets = False
+    if online_carry_attention_cache and not online_updates:
+        raise RuntimeError("online_carry_attention_cache=true requires train.online_updates=true")
+    if online_carry_attention_cache and not online_boundary_targets:
+        raise RuntimeError(
+            "online_carry_attention_cache=true requires train.online_boundary_targets=true "
+            "(non-overlap chunking)."
+        )
     step_iter = iter(dataloader)
     epoch = 0
     metrics: Dict[str, float] = {}
@@ -536,50 +833,109 @@ def run_training_loop(
             if chunk_size <= 0:
                 inferred = _infer_online_chunk_size(base_model)
                 chunk_size = inferred if inferred is not None else tokens.size(1)
-            if chunk_size < 2:
-                # Next-token CE needs at least 2 tokens per chunk. Clamp to avoid a silent no-op
-                # when configs infer update_period=1.
-                print(f"[train] online_chunk_size={chunk_size} is too small; clamping to 2")
-                chunk_size = 2
-            for start in range(0, tokens.size(1), chunk_size):
-                end = min(start + chunk_size, tokens.size(1))
-                chunk_tokens = tokens[:, start:end]
-                if chunk_tokens.size(1) <= 1:
+            if chunk_size < 1:
+                print(f"[train] online_chunk_size={chunk_size} is too small; clamping to 1")
+                chunk_size = 1
+            attention_cache = None
+            if online_carry_attention_cache:
+                init_attention_cache = getattr(base_model, "init_attention_cache", None)
+                if not callable(init_attention_cache):
+                    raise RuntimeError(
+                        "online_carry_attention_cache=true requires model.init_attention_cache()"
+                    )
+                attention_cache = init_attention_cache()
+
+            chunk_iter: Iterator[tuple[torch.Tensor, torch.Tensor | None, bool]]
+            if online_boundary_targets:
+                chunk_iter = _iter_online_boundary_chunks(tokens, chunk_size=chunk_size)
+            else:
+                chunk_iter = (
+                    (chunk, None, finalize_updates)
+                    for chunk, finalize_updates in _iter_online_token_chunks(
+                        tokens, chunk_size=chunk_size
+                    )
+                )
+            for chunk_tokens, next_tokens, finalize_updates in chunk_iter:
+                target_count = chunk_tokens.size(1) - 1 + (0 if next_tokens is None else 1)
+                if target_count <= 0:
                     continue
+                chunk_attention_cache = attention_cache
                 with autocast_factory():
-                    logits, _pre, block_outputs = (
-                        base_model.forward_with_block_outputs(chunk_tokens, fast_state=fast_state)
-                        if fast_state is not None
-                        else base_model.forward_with_block_outputs(chunk_tokens)
-                    )
-                    loss = torch.nn.functional.cross_entropy(
-                        logits[:, :-1].reshape(-1, logits.size(-1)),
-                        chunk_tokens[:, 1:].reshape(-1),
-                    )
+                    if attention_cache is not None:
+                        logits, _pre, block_outputs, attention_cache = (
+                            base_model.forward_with_block_outputs(
+                                chunk_tokens,
+                                fast_state=fast_state,
+                                attention_cache=chunk_attention_cache,
+                                return_attention_cache=True,
+                            )
+                        )
+                    else:
+                        logits, _pre, block_outputs = (
+                            base_model.forward_with_block_outputs(
+                                chunk_tokens,
+                                fast_state=fast_state,
+                            )
+                            if fast_state is not None
+                            else base_model.forward_with_block_outputs(chunk_tokens)
+                        )
+                    if next_tokens is None:
+                        loss = torch.nn.functional.cross_entropy(
+                            logits[:, :-1].reshape(-1, logits.size(-1)),
+                            chunk_tokens[:, 1:].reshape(-1),
+                        )
+                    else:
+                        boundary_targets = torch.cat(
+                            [chunk_tokens[:, 1:], next_tokens.unsqueeze(1)],
+                            dim=1,
+                        )
+                        loss = torch.nn.functional.cross_entropy(
+                            logits[:, : boundary_targets.size(1), :].reshape(-1, logits.size(-1)),
+                            boundary_targets.reshape(-1),
+                        )
                 surprise_override = _compute_surprise_override(
                     surprise_metric,
                     logits=logits,
                     tokens=chunk_tokens,
                     loss=loss,
+                    next_tokens=next_tokens,
                 )
                 if per_layer_teach:
-                    teach_signals = _compute_layer_teach_signals(loss, block_outputs)
-                    teach_signal_norm += float(
-                        torch.stack([sig.norm(dim=-1).mean() for sig in teach_signals]).mean()
-                    ) * (chunk_tokens.size(1) - 1)
-                else:
-                    teach_signal = compute_teach_signal(base_model, logits, chunk_tokens)
-                    teach_signal_norm += (
-                        teach_signal.norm(dim=-1).mean().item() * (chunk_tokens.size(1) - 1)
+                    differentiable_updates = algorithm_mode == "boundary_state_grad_through_write"
+                    teach_signals = _compute_layer_teach_signals(
+                        loss,
+                        block_outputs,
+                        detach=not differentiable_updates,
+                        create_graph=differentiable_updates,
                     )
-                loss.backward()
-                with torch.no_grad():
+                    mean_teach_norm = torch.stack(
+                        [sig.detach().norm(dim=-1).mean() for sig in teach_signals]
+                    ).mean()
+                    teach_signal_norm += float(
+                        mean_teach_norm
+                    ) * target_count
+                else:
+                    teach_signal = compute_teach_signal(
+                        base_model,
+                        logits,
+                        chunk_tokens,
+                        next_tokens=next_tokens,
+                    )
+                    teach_signal_norm += teach_signal.norm(dim=-1).mean().item() * target_count
+                differentiable_updates = algorithm_mode == "boundary_state_grad_through_write"
+                # Boundary-state mode keeps a cross-chunk differentiable write path.
+                # Retain the graph so later chunks can backprop through earlier writes.
+                loss.backward(retain_graph=differentiable_updates)
+                if differentiable_updates:
                     if per_layer_teach:
                         base_model(
                             chunk_tokens,
                             teach_signals=teach_signals,
                             surprise_value=surprise_override,
                             fast_state=fast_state,
+                            finalize_updates=finalize_updates,
+                            attention_cache=chunk_attention_cache,
+                            differentiable_updates=True,
                         )
                     else:
                         base_model(
@@ -587,11 +943,43 @@ def run_training_loop(
                             teach_signal=teach_signal,
                             surprise_value=surprise_override,
                             fast_state=fast_state,
+                            finalize_updates=finalize_updates,
+                            attention_cache=chunk_attention_cache,
+                            differentiable_updates=True,
                         )
                     if hasattr(base_model, "pop_update_metrics"):
                         update_metrics = base_model.pop_update_metrics()
-                total_loss += loss.item() * (chunk_tokens.size(1) - 1)
-                total_tokens += chunk_tokens.size(1) - 1
+                else:
+                    with torch.no_grad():
+                        if per_layer_teach:
+                            base_model(
+                                chunk_tokens,
+                                teach_signals=teach_signals,
+                                surprise_value=surprise_override,
+                                fast_state=fast_state,
+                                finalize_updates=finalize_updates,
+                                attention_cache=chunk_attention_cache,
+                                differentiable_updates=False,
+                            )
+                        else:
+                            base_model(
+                                chunk_tokens,
+                                teach_signal=teach_signal,
+                                surprise_value=surprise_override,
+                                fast_state=fast_state,
+                                finalize_updates=finalize_updates,
+                                attention_cache=chunk_attention_cache,
+                                differentiable_updates=False,
+                            )
+                        if hasattr(base_model, "pop_update_metrics"):
+                            update_metrics = base_model.pop_update_metrics()
+                total_loss += loss.item() * target_count
+                total_tokens += target_count
+            _check_online_supervised_pairs(
+                strict=strict_streaming,
+                observed_pairs=total_tokens,
+                seq_len=int(tokens.size(1)),
+            )
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), max_norm=1.0)
             optimizer.step()
             loss = torch.tensor(total_loss / max(total_tokens, 1), device=device)
@@ -622,6 +1010,7 @@ def run_training_loop(
                 logits=logits,
                 tokens=tokens,
                 loss=loss,
+                next_tokens=None,
             )
             optimizer.zero_grad()
             if per_layer_teach and hasattr(base_model, "forward_with_block_outputs"):
@@ -1035,11 +1424,22 @@ def _log_run_features(
 ) -> None:
     mp_cfg = cfg.train.get("mixed_precision", {})
     compile_cfg = cfg.train.get("compile", {})
+    algorithm_mode = str(cfg.train.get("algorithm_mode", "two_pass_stopgrad_updates"))
     features: dict[str, object] = {
         "train.mixed_precision_enabled": bool(mp_cfg.get("enabled", False)),
         "train.mixed_precision_dtype": str(mp_cfg.get("dtype", "bf16")),
         "train.compile_enabled": bool(compile_cfg.get("enable", False)),
         "train.compile_mode": str(compile_cfg.get("mode", "default")) if compile_cfg else "default",
+        "train.strict_streaming_contract": bool(cfg.train.get("strict_streaming_contract", False)),
+        "train.online_updates": bool(cfg.train.get("online_updates", False)),
+        "train.online_boundary_targets": bool(cfg.train.get("online_boundary_targets", False)),
+        "train.online_carry_attention_cache": bool(
+            cfg.train.get("online_carry_attention_cache", False)
+        ),
+        "train.use_fast_state": bool(cfg.train.get("use_fast_state", False)),
+        "train.algorithm_mode": algorithm_mode,
+        "train.backprop_through_online_writes": algorithm_mode
+        == "boundary_state_grad_through_write",
         "attention.flash_enabled": _detect_flash_attention(model),
         "device": device.type,
     }
@@ -1105,6 +1505,13 @@ def write_checkpoint_metadata(cfg: DictConfig, ckpt_path: Path, step: int) -> No
         "config_sha256": config_hash,
         "tokenizer_hash": _checksum_path(tokenizer_path) if tokenizer_path else None,
         "config_path": str(config_path),
+        "algorithm_mode": str(cfg.train.get("algorithm_mode", "two_pass_stopgrad_updates")),
+        "online_updates": bool(cfg.train.get("online_updates", False)),
+        "online_boundary_targets": bool(cfg.train.get("online_boundary_targets", False)),
+        "online_carry_attention_cache": bool(
+            cfg.train.get("online_carry_attention_cache", False)
+        ),
+        "use_fast_state": bool(cfg.train.get("use_fast_state", False)),
         "rng_states": _capture_rng_states(),
     }
     ckpt_path.with_suffix(".meta.json").write_text(json.dumps(metadata, indent=2))
@@ -1177,6 +1584,7 @@ def _seed_everything(seed: int, *, deterministic: bool = False) -> None:
             torch.backends.cudnn.benchmark = False  # type: ignore[attr-defined]
             torch.backends.cudnn.deterministic = True  # type: ignore[attr-defined]
     else:
+        torch.use_deterministic_algorithms(False)
         if hasattr(torch.backends, "cudnn"):
             torch.backends.cudnn.benchmark = True  # type: ignore[attr-defined]
             torch.backends.cudnn.deterministic = False  # type: ignore[attr-defined]
