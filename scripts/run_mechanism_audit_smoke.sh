@@ -12,12 +12,17 @@ uv run python train.py --config-name pilot_paper_faithful \
   train.steps=1 \
   train.device=cpu \
   train.online_chunk_size=9 \
+  model.dim=128 \
+  model.num_layers=2 \
+  model.heads=4 \
   data.source=synthetic \
   +data.vocab_size=32000 \
   data.seq_len=9 \
   +data.dataset_size=8 \
   data.batch_size=1 \
   data.num_workers=0 \
+  train.mixed_precision.enabled=false \
+  train.compile.enable=false \
   logging.enabled=true \
   logging.backend=json \
   logging.path="${LOG_PATH}"
