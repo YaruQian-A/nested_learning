@@ -47,6 +47,13 @@ uv run python scripts/eval/zeroshot.py \
 - Versioning/stability policy: `docs/VERSIONING_POLICY.md`
 - Golden repro environment: Python 3.12 + `uv lock` + PyTorch 2.9.x
 
+macOS / Apple Silicon expectations:
+- Mac users can run install + CLI + eval/smoke workflows.
+- `train.device=mps` is supported for small/local runs.
+- Linux + CUDA remains the only Tier 1 full-training path in this repo.
+- Cross-backend numerical parity (CUDA vs MPS) is not guaranteed.
+- If MPS is unavailable, device selection falls back to CPU (`nl doctor --json` shows this clearly).
+
 ## Installation (pip-first)
 1. Create and activate a virtual environment.
 2. Install Torch first (CPU/CUDA wheel selection is backend-specific).
@@ -163,6 +170,7 @@ This confirms:
   ```bash
   uv run nl train --config-name pilot_smoke --override train.device=mps
   ```
+  Use this path for smoke and small local runs; long/full-scale paper-regime runs are not a supported Mac target in this repository.
 - Script-based entrypoint (legacy-compatible):
   ```bash
   uv run python train.py --config-name pilot_smoke

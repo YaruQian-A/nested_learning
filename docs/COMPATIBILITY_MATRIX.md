@@ -23,6 +23,17 @@ Notes:
 - Strict paper-faithful online-update semantics in distributed settings remain constrained by design.
 - Numerical parity across backend families (CUDA/MPS/ROCm) is not guaranteed.
 
+## Apple Silicon (MPS) practical expectations
+
+On macOS Apple Silicon, this repo is intended to support:
+- install/import,
+- CLI diagnostics (`nl doctor`),
+- smoke/eval workflows,
+- small local runs with `train.device=mps`.
+
+This repo does not currently treat macOS/MPS as a full paper-scale training target.
+For full-size training and published artifact reproduction, prefer Linux + CUDA Tier 1 environments.
+
 ## Runtime Degradation Policy
 
 At runtime, unsupported performance features should degrade gracefully:
@@ -40,4 +51,3 @@ For reproducibility of this repository’s published artifacts, prefer:
 - `uv lock` / `uv sync --all-extras --dev`
 
 The package metadata allows broader install ranges for portability, while the lockfile remains the canonical dev/test environment.
-
