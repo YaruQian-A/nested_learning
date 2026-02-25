@@ -57,3 +57,11 @@ After the tag workflow completes, confirm the Releases tab entry for that tag co
 - `nested_learning-<version>-py3-none-any.whl`
 - `nested_learning-<version>.tar.gz`
 - `SHA256SUMS.txt`
+
+## 7) Verify GitHub Packages tab (GHCR)
+
+The repository also ships `.github/workflows/packages.yml`, which publishes:
+- `ghcr.io/<owner>/nested-learning-dist:<tag>`
+
+This is an OCI artifact bundle for distribution files (`dist/*`) and appears in the GitHub Packages tab.
+Use PyPI for normal `pip install` workflows.

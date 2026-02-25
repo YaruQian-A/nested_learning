@@ -32,6 +32,7 @@ Use this checklist for package distribution releases (separate from checkpoint/a
   - [ ] wheel (`.whl`)
   - [ ] source tarball (`.tar.gz`)
   - [ ] `SHA256SUMS.txt`
+- [ ] GitHub Packages (GHCR) workflow succeeds and publishes `nested-learning-dist` for the tag.
 - [ ] Release notes include migration notes (if any) and links to compatibility/versioning docs.
 
 ## Post-Release

@@ -22,6 +22,7 @@ All notable changes to this project will be documented here. The format loosely 
 - `scripts/checks/check_data_script_help.sh` to guarantee `scripts/data/* --help` exits cleanly; wired into CI.
 - Markdown anchor verification in `scripts/checks/verify_docs_refs.py` with dedicated unit coverage.
 - Tag release automation now creates GitHub Release entries with attached wheel/sdist artifacts plus `SHA256SUMS.txt`.
+- Added GHCR package publishing workflow (`.github/workflows/packages.yml`) so the Packages tab contains a versioned `nested-learning-dist` OCI bundle.
 
 ### Changed
 - README / compliance / streaming docs now reflect boundary-target mode, optional KV-cache carry, and explicit scope boundaries.

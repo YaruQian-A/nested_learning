@@ -320,6 +320,19 @@ Before tagging or announcing a new checkpoint, work through:
 Tag pushes (`v*`) automatically publish:
 - PyPI/TestPyPI package artifacts (via Trusted Publishing), and
 - a GitHub Release entry with wheel, sdist, and `SHA256SUMS.txt` in the Releases tab.
+- a GitHub Packages (GHCR) OCI bundle (`nested-learning-dist`) containing `dist/*`.
+
+GitHub Packages note:
+- The repo publishes an OCI artifact bundle to GHCR (shown under the Packages tab), not a Python package registry endpoint.
+- Python installs should still use PyPI (`pip install nested-learning`).
+
+Example (pull/extract dist artifacts from GHCR):
+```bash
+docker pull ghcr.io/kmccleary3301/nested-learning-dist:latest
+cid=$(docker create ghcr.io/kmccleary3301/nested-learning-dist:latest)
+docker cp "$cid:/dist" ./dist_from_ghcr
+docker rm "$cid"
+```
 
 For versioning semantics and breaking-change expectations, see `docs/VERSIONING_POLICY.md`.
 
